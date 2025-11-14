@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import io
 import re
 import time
 from json import JSONDecodeError
@@ -259,20 +260,45 @@ async def synthesize_chunk(
         raise ValueError("Text cannot be empty for speech synthesis")
     
     try:
-        communicator = edge_tts.Communicate(text, voice=voice_id, rate=rate, volume=volume)
+        # Create communicator with explicit parameters
+        communicator = edge_tts.Communicate(
+            text=text.strip(),
+            voice=voice_id,
+            rate=rate,
+            volume=volume
+        )
+        
         audio = bytearray()
         audio_received = False
+        chunk_count = 0
 
+        # Stream the audio data
         async for chunk in communicator.stream():
-            if chunk["type"] == "audio" and chunk.get("data"):
-                audio.extend(chunk["data"])
+            chunk_count += 1
+            # Check for both "audio" type and "data" key
+            if chunk.get("type") == "audio":
+                chunk_data = chunk.get("data")
+                if chunk_data:
+                    audio.extend(chunk_data)
+                    audio_received = True
+            # Also handle case where data might be directly in chunk
+            elif chunk_data := chunk.get("data"):
+                audio.extend(chunk_data)
                 audio_received = True
+
+        # Debug info: if we got chunks but no audio, that's suspicious
+        if chunk_count == 0:
+            raise RuntimeError(
+                f"edge-tts stream returned no chunks. "
+                f"This may indicate a network issue or blocked connection on Streamlit Cloud. "
+                f"Text: '{text[:50]}...', Voice: {voice_id}"
+            )
 
         if not audio_received or len(audio) == 0:
             raise RuntimeError(
-                f"No audio was received from edge-tts. "
+                f"No audio data was received from edge-tts (received {chunk_count} chunks but no audio). "
                 f"Text length: {len(text)}, Voice: {voice_id}, Rate: {rate}, Volume: {volume}. "
-                f"Please verify that your parameters are correct."
+                f"This may be a network connectivity issue on Streamlit Cloud."
             )
 
         return bytes(audio)
@@ -282,7 +308,8 @@ async def synthesize_chunk(
             raise
         raise RuntimeError(
             f"Speech synthesis error: {exc}. "
-            f"Text length: {len(text)}, Voice: {voice_id}"
+            f"Text length: {len(text)}, Voice: {voice_id}. "
+            f"Error type: {type(exc).__name__}"
         ) from exc
 
 
@@ -298,14 +325,45 @@ def _run_async_safely(coro):
         new_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(new_loop)
         try:
-            return new_loop.run_until_complete(coro)
+            result = new_loop.run_until_complete(coro)
+            return result
+        except Exception as e:
+            # Close the loop before re-raising
+            new_loop.close()
+            raise
         finally:
+            # Ensure loop is closed
+            try:
+                pending = asyncio.all_tasks(new_loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    new_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
             new_loop.close()
     
     # Always run in a thread to avoid event loop conflicts on Streamlit Cloud
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(_run_in_new_loop)
-        return future.result(timeout=300)  # 5 minute timeout for long audio
+        try:
+            return future.result(timeout=300)  # 5 minute timeout for long audio
+        except concurrent.futures.TimeoutError:
+            raise RuntimeError(
+                "Speech synthesis timed out after 5 minutes. "
+                "This may indicate a network connectivity issue on Streamlit Cloud."
+            )
+
+
+async def verify_voice_available(voice_id: str) -> bool:
+    """Verify that a voice is available (optional check)."""
+    try:
+        voices = await edge_tts.list_voices()
+        voice_list = [v["ShortName"] for v in voices]
+        return voice_id in voice_list
+    except Exception:
+        # If verification fails, assume voice is valid and continue
+        return True
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -321,6 +379,11 @@ def synthesize_speech(
     
     if not voice_id:
         raise ValueError("Voice ID cannot be empty")
+    
+    # Clean and validate text
+    text = text.strip()
+    if len(text) < 1:
+        raise ValueError("Text must contain at least one character")
     
     rate = rate_to_edge(rate_value)
     volume = volume_to_edge(volume_value)
@@ -354,15 +417,31 @@ def synthesize_speech(
                 "The request took too long. Try with shorter text or check your network connection."
             )
         except Exception as exc:
-            error_msg = str(exc)
+            error_msg = str(exc).lower()
+            exc_type = type(exc).__name__
+            
             # Provide more helpful error messages for common Streamlit Cloud issues
-            if "event loop" in error_msg.lower() or "asyncio" in error_msg.lower():
+            if "event loop" in error_msg or "asyncio" in error_msg:
                 raise RuntimeError(
                     f"Event loop error on chunk {i+1} of {len(chunks)}. "
                     "This may be a Streamlit Cloud environment issue. Please try again."
                 ) from exc
+            elif "connection" in error_msg or "network" in error_msg or "timeout" in error_msg:
+                raise RuntimeError(
+                    f"Network error on chunk {i+1} of {len(chunks)}: {exc}. "
+                    "Streamlit Cloud may be blocking edge-tts connections to Microsoft servers. "
+                    "Please check your network settings or try again later."
+                ) from exc
+            elif "no audio" in error_msg or "audio" in error_msg:
+                # This is the specific error we're seeing
+                raise RuntimeError(
+                    f"Audio generation failed on chunk {i+1} of {len(chunks)}: {exc}. "
+                    "This usually indicates that edge-tts cannot connect to Microsoft's servers "
+                    "from Streamlit Cloud, or the voice/text combination is invalid. "
+                    f"Chunk text: '{chunk[:100]}...' (length: {len(chunk)})"
+                ) from exc
             raise RuntimeError(
-                f"Failed to synthesize chunk {i+1} of {len(chunks)}: {exc}"
+                f"Failed to synthesize chunk {i+1} of {len(chunks)}: {exc} (Type: {exc_type})"
             ) from exc
 
     if len(audio_buffer) == 0:
