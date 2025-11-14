@@ -287,22 +287,25 @@ async def synthesize_chunk(
 
 
 def _run_async_safely(coro):
-    """Run async function safely, handling existing event loops."""
-    try:
-        # Try to get the current event loop
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If loop is running, we need to use a different approach
-            # Create a new event loop in a thread
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, coro)
-                return future.result()
-        else:
-            # Loop exists but not running, we can use it
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        # No event loop exists, create a new one
-        return asyncio.run(coro)
+    """Run async function safely, handling existing event loops.
+    
+    Streamlit Cloud often has event loop conflicts, so we always run
+    in a separate thread with a fresh event loop.
+    """
+    def _run_in_new_loop():
+        """Create a completely new event loop in this thread."""
+        # Create a new event loop for this thread
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        try:
+            return new_loop.run_until_complete(coro)
+        finally:
+            new_loop.close()
+    
+    # Always run in a thread to avoid event loop conflicts on Streamlit Cloud
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(_run_in_new_loop)
+        return future.result(timeout=300)  # 5 minute timeout for long audio
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -333,6 +336,10 @@ def synthesize_speech(
             # Skip empty chunks but warn
             continue
         
+        # Add small delay between chunks on Streamlit Cloud to avoid rate limits
+        if i > 0:
+            time.sleep(0.5)
+        
         try:
             chunk_audio = _run_async_safely(
                 synthesize_chunk(chunk, voice_id=voice_id, rate=rate, volume=volume)
@@ -341,7 +348,19 @@ def synthesize_speech(
                 audio_buffer.extend(chunk_audio)
             else:
                 raise RuntimeError(f"Chunk {i+1} returned empty audio")
+        except concurrent.futures.TimeoutError:
+            raise RuntimeError(
+                f"Timeout while synthesizing chunk {i+1} of {len(chunks)}. "
+                "The request took too long. Try with shorter text or check your network connection."
+            )
         except Exception as exc:
+            error_msg = str(exc)
+            # Provide more helpful error messages for common Streamlit Cloud issues
+            if "event loop" in error_msg.lower() or "asyncio" in error_msg.lower():
+                raise RuntimeError(
+                    f"Event loop error on chunk {i+1} of {len(chunks)}. "
+                    "This may be a Streamlit Cloud environment issue. Please try again."
+                ) from exc
             raise RuntimeError(
                 f"Failed to synthesize chunk {i+1} of {len(chunks)}: {exc}"
             ) from exc
