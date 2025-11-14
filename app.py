@@ -58,6 +58,19 @@ MAX_CHARS_TRANSLATION = 4500
 MAX_CHARS_TTS = 3000
 
 translator = Translator()
+if not hasattr(Translator, "raise_Exception"):
+    # googletrans 4.0.0rc1 uses `raise_Exception` in one code path.
+    # Python 3.13+ removed that attribute, so keep them in sync.
+    setattr(
+        Translator,
+        "raise_Exception",
+        property(
+            lambda self: getattr(self, "raise_exception", False),
+            lambda self, value: setattr(self, "raise_exception", value),
+        ),
+    )
+if not hasattr(translator, "raise_Exception"):
+    translator.raise_Exception = translator.raise_exception
 GT_LANGUAGES = {code.lower(): name for code, name in LANGUAGES.items()}
 
 
