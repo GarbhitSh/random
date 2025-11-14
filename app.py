@@ -141,18 +141,25 @@ def volume_to_edge(volume_value: int) -> str:
 
 
 def detect_language_safe(sample: str):
+    """Safely detect language, gracefully handling HTTP errors."""
     for client in TRANSLATORS:
         try:
             return client.detect(sample)
         except Exception as exc:
-            if 'Unexpected status code "404"' in str(exc):
+            exc_str = str(exc)
+            # Handle common HTTP errors gracefully (404, 429, 503, etc.)
+            if any(code in exc_str for code in ['404', '429', '503', '500']):
                 continue
-            raise
+            # For other errors, log but don't crash - just return None
+            continue
     return None
 
 
 def translate_chunk_with_fallback(chunk: str, target_lang: str) -> str:
+    """Translate a chunk with fallback to alternative endpoints."""
     last_status_exc: Optional[Exception] = None
+    status_codes_seen = set()
+    
     for client in TRANSLATORS:
         try:
             result = client.translate(chunk, dest=target_lang)
@@ -163,18 +170,41 @@ def translate_chunk_with_fallback(chunk: str, target_lang: str) -> str:
                 "Try redeploying later or provide a paid translation API."
             ) from exc
         except Exception as exc:
-            if 'Unexpected status code "404"' in str(exc):
-                last_status_exc = exc
-                continue
-            raise
+            exc_str = str(exc)
+            # Extract status code from error message
+            for code in ['404', '429', '503', '500']:
+                if code in exc_str:
+                    status_codes_seen.add(code)
+                    last_status_exc = exc
+                    break
+            else:
+                # Unknown error - re-raise it
+                raise
+            continue
         else:
             return result.text
 
-    raise RuntimeError(
-        "Google Translate returned HTTP 404 for every available endpoint. "
-        "Streamlit Cloud may be blocking the unofficial googletrans backend. "
-        "Redeploy later or switch to a paid translation provider (e.g. Google Cloud Translation)."
-    ) from last_status_exc
+    # Build helpful error message based on status codes seen
+    if '429' in status_codes_seen:
+        error_msg = (
+            "Google Translate returned HTTP 429 (rate limit exceeded). "
+            "The unofficial googletrans API is being throttled. "
+            "Please wait a few minutes and try again, or switch to a paid translation provider."
+        )
+    elif '404' in status_codes_seen:
+        error_msg = (
+            "Google Translate returned HTTP 404 for every available endpoint. "
+            "Streamlit Cloud may be blocking the unofficial googletrans backend. "
+            "Redeploy later or switch to a paid translation provider (e.g. Google Cloud Translation)."
+        )
+    else:
+        error_msg = (
+            f"Google Translate returned errors ({', '.join(sorted(status_codes_seen))}) "
+            "for all available endpoints. The unofficial googletrans API may be temporarily unavailable. "
+            "Please try again later or switch to a paid translation provider."
+        )
+    
+    raise RuntimeError(error_msg) from last_status_exc
 
 
 @st.cache_data(show_spinner=False)
@@ -261,20 +291,24 @@ with st.container():
     st.caption(f"Characters: {char_count:,}")
     if raw_text.strip():
         sample = raw_text[:5000]
-        detection = detect_language_safe(sample)
-        if detection is None:
-            st.caption("Detected language: unavailable")
-        else:
-            lang_code = detection.lang.lower()
-            lang_label = GT_LANGUAGES.get(lang_code, lang_code).title()
-            confidence = getattr(detection, "confidence", None)
-            if confidence is not None:
-                st.caption(
-                    f"Detected language: {lang_label} "
-                    f"(confidence {confidence * 100:.1f}%)"
-                )
+        try:
+            detection = detect_language_safe(sample)
+            if detection is None:
+                st.caption("Detected language: unavailable")
             else:
-                st.caption(f"Detected language: {lang_label}")
+                lang_code = detection.lang.lower()
+                lang_label = GT_LANGUAGES.get(lang_code, lang_code).title()
+                confidence = getattr(detection, "confidence", None)
+                if confidence is not None:
+                    st.caption(
+                        f"Detected language: {lang_label} "
+                        f"(confidence {confidence * 100:.1f}%)"
+                    )
+                else:
+                    st.caption(f"Detected language: {lang_label}")
+        except Exception:
+            # Extra safety net - if anything unexpected happens, just skip detection
+            st.caption("Detected language: unavailable")
 
 
 col_translate, col_settings = st.columns([2, 1])
