@@ -1,5 +1,6 @@
 import asyncio
 import re
+from json import JSONDecodeError
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -57,20 +58,39 @@ TARGET_LANGUAGES = {
 MAX_CHARS_TRANSLATION = 4500
 MAX_CHARS_TTS = 3000
 
-translator = Translator()
-if not hasattr(Translator, "raise_Exception"):
-    # googletrans 4.0.0rc1 uses `raise_Exception` in one code path.
-    # Python 3.13+ removed that attribute, so keep them in sync.
-    setattr(
-        Translator,
-        "raise_Exception",
-        property(
-            lambda self: getattr(self, "raise_exception", False),
-            lambda self, value: setattr(self, "raise_exception", value),
-        ),
-    )
-if not hasattr(translator, "raise_Exception"):
-    translator.raise_Exception = translator.raise_exception
+def _init_translator(service_urls):
+    translator_instance = Translator(service_urls=service_urls)
+    if not hasattr(Translator, "raise_Exception"):
+        # googletrans 4.0.0rc1 uses `raise_Exception` in one code path.
+        # Python 3.13+ removed that attribute, so keep them in sync.
+        setattr(
+            Translator,
+            "raise_Exception",
+            property(
+                lambda self: getattr(self, "raise_exception", False),
+                lambda self, value: setattr(self, "raise_exception", value),
+            ),
+        )
+    if not hasattr(translator_instance, "raise_Exception"):
+        translator_instance.raise_Exception = getattr(
+            translator_instance, "raise_exception", False
+        )
+    try:
+        translator_instance.raise_Exception = True
+    except Exception:
+        setattr(
+            translator_instance,
+            "raise_Exception",
+            getattr(translator_instance, "raise_exception", False),
+        )
+    return translator_instance
+
+
+PRIMARY_TRANSLATOR = _init_translator(
+    ["translate.googleapis.com", "translate.google.com"]
+)
+FALLBACK_TRANSLATOR = _init_translator(["translate.google.com"])
+TRANSLATORS = (PRIMARY_TRANSLATOR, FALLBACK_TRANSLATOR)
 GT_LANGUAGES = {code.lower(): name for code, name in LANGUAGES.items()}
 
 
@@ -120,6 +140,43 @@ def volume_to_edge(volume_value: int) -> str:
     return f"{volume_value:+d}%"
 
 
+def detect_language_safe(sample: str):
+    for client in TRANSLATORS:
+        try:
+            return client.detect(sample)
+        except Exception as exc:
+            if 'Unexpected status code "404"' in str(exc):
+                continue
+            raise
+    return None
+
+
+def translate_chunk_with_fallback(chunk: str, target_lang: str) -> str:
+    last_status_exc: Optional[Exception] = None
+    for client in TRANSLATORS:
+        try:
+            result = client.translate(chunk, dest=target_lang)
+        except JSONDecodeError as exc:
+            raise RuntimeError(
+                "Google Translate returned an empty or invalid response. "
+                "Streamlit Cloud sometimes blocks the unofficial googletrans backend. "
+                "Try redeploying later or provide a paid translation API."
+            ) from exc
+        except Exception as exc:
+            if 'Unexpected status code "404"' in str(exc):
+                last_status_exc = exc
+                continue
+            raise
+        else:
+            return result.text
+
+    raise RuntimeError(
+        "Google Translate returned HTTP 404 for every available endpoint. "
+        "Streamlit Cloud may be blocking the unofficial googletrans backend. "
+        "Redeploy later or switch to a paid translation provider (e.g. Google Cloud Translation)."
+    ) from last_status_exc
+
+
 @st.cache_data(show_spinner=False)
 def translate_large_text(text: str, target_lang: str) -> str:
     if target_lang in ("none", "", None):
@@ -129,8 +186,7 @@ def translate_large_text(text: str, target_lang: str) -> str:
     translated_segments: List[str] = []
 
     for chunk in chunks:
-        result = translator.translate(chunk, dest=target_lang)
-        translated_segments.append(result.text)
+        translated_segments.append(translate_chunk_with_fallback(chunk, target_lang))
 
     return " ".join(translated_segments)
 
@@ -205,8 +261,10 @@ with st.container():
     st.caption(f"Characters: {char_count:,}")
     if raw_text.strip():
         sample = raw_text[:5000]
-        try:
-            detection = translator.detect(sample)
+        detection = detect_language_safe(sample)
+        if detection is None:
+            st.caption("Detected language: unavailable")
+        else:
             lang_code = detection.lang.lower()
             lang_label = GT_LANGUAGES.get(lang_code, lang_code).title()
             confidence = getattr(detection, "confidence", None)
@@ -217,8 +275,6 @@ with st.container():
                 )
             else:
                 st.caption(f"Detected language: {lang_label}")
-        except Exception:
-            st.caption("Detected language: unavailable")
 
 
 col_translate, col_settings = st.columns([2, 1])
