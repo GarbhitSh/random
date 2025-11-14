@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import re
+import time
 from json import JSONDecodeError
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -155,41 +157,63 @@ def detect_language_safe(sample: str):
     return None
 
 
-def translate_chunk_with_fallback(chunk: str, target_lang: str) -> str:
-    """Translate a chunk with fallback to alternative endpoints."""
+def translate_chunk_with_fallback(chunk: str, target_lang: str, max_retries: int = 3) -> str:
+    """Translate a chunk with fallback to alternative endpoints and retry logic."""
     last_status_exc: Optional[Exception] = None
     status_codes_seen = set()
     
-    for client in TRANSLATORS:
-        try:
-            result = client.translate(chunk, dest=target_lang)
-        except JSONDecodeError as exc:
-            raise RuntimeError(
-                "Google Translate returned an empty or invalid response. "
-                "Streamlit Cloud sometimes blocks the unofficial googletrans backend. "
-                "Try redeploying later or provide a paid translation API."
-            ) from exc
-        except Exception as exc:
-            exc_str = str(exc)
-            # Extract status code from error message
-            for code in ['404', '429', '503', '500']:
-                if code in exc_str:
-                    status_codes_seen.add(code)
+    # Retry logic with exponential backoff for rate limits
+    for attempt in range(max_retries):
+        for client in TRANSLATORS:
+            try:
+                result = client.translate(chunk, dest=target_lang)
+                # Success - return immediately
+                return result.text
+            except JSONDecodeError as exc:
+                raise RuntimeError(
+                    "Google Translate returned an empty or invalid response. "
+                    "Streamlit Cloud sometimes blocks the unofficial googletrans backend. "
+                    "Try redeploying later or provide a paid translation API."
+                ) from exc
+            except Exception as exc:
+                exc_str = str(exc)
+                # Check if it's a retryable error (429, 503, 500)
+                is_rate_limit = '429' in exc_str
+                is_retryable = any(code in exc_str for code in ['429', '503', '500'])
+                is_404 = '404' in exc_str
+                
+                if is_404:
+                    status_codes_seen.add('404')
                     last_status_exc = exc
-                    break
-            else:
-                # Unknown error - re-raise it
-                raise
-            continue
-        else:
-            return result.text
+                    # 404 is not retryable - try next client
+                    continue
+                elif is_retryable:
+                    status_codes_seen.add('429' if is_rate_limit else '503' if '503' in exc_str else '500')
+                    last_status_exc = exc
+                    
+                    # If it's a rate limit and we have retries left, wait and retry
+                    if is_rate_limit and attempt < max_retries - 1:
+                        # Exponential backoff: 2^attempt seconds (2, 4, 8 seconds)
+                        wait_time = 2 ** attempt
+                        time.sleep(wait_time)
+                        # Break inner loop to retry from the beginning
+                        break
+                    # Otherwise try next client
+                    continue
+                else:
+                    # Unknown error - re-raise it
+                    raise
+        
+        # If we've exhausted all clients and this was the last attempt, break
+        if attempt == max_retries - 1:
+            break
 
     # Build helpful error message based on status codes seen
     if '429' in status_codes_seen:
         error_msg = (
-            "Google Translate returned HTTP 429 (rate limit exceeded). "
-            "The unofficial googletrans API is being throttled. "
-            "Please wait a few minutes and try again, or switch to a paid translation provider."
+            "Google Translate returned HTTP 429 (rate limit exceeded) after multiple retries. "
+            "The unofficial googletrans API is being heavily throttled. "
+            "Please wait 5-10 minutes and try again, or switch to a paid translation provider."
         )
     elif '404' in status_codes_seen:
         error_msg = (
@@ -200,7 +224,8 @@ def translate_chunk_with_fallback(chunk: str, target_lang: str) -> str:
     else:
         error_msg = (
             f"Google Translate returned errors ({', '.join(sorted(status_codes_seen))}) "
-            "for all available endpoints. The unofficial googletrans API may be temporarily unavailable. "
+            "for all available endpoints after multiple retries. "
+            "The unofficial googletrans API may be temporarily unavailable. "
             "Please try again later or switch to a paid translation provider."
         )
     
@@ -215,7 +240,12 @@ def translate_large_text(text: str, target_lang: str) -> str:
     chunks = chunk_text(text, MAX_CHARS_TRANSLATION)
     translated_segments: List[str] = []
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
+        # Add delay between chunks to avoid rate limiting (except for the first chunk)
+        if i > 0:
+            # Progressive delay: 1 second between chunks to be respectful of rate limits
+            time.sleep(1.0)
+        
         translated_segments.append(translate_chunk_with_fallback(chunk, target_lang))
 
     return " ".join(translated_segments)
@@ -224,14 +254,55 @@ def translate_large_text(text: str, target_lang: str) -> str:
 async def synthesize_chunk(
     text: str, *, voice_id: str, rate: str, volume: str
 ) -> bytes:
-    communicator = edge_tts.Communicate(text, voice=voice_id, rate=rate, volume=volume)
-    audio = bytearray()
+    """Synthesize a chunk of text to audio using edge-tts."""
+    if not text or not text.strip():
+        raise ValueError("Text cannot be empty for speech synthesis")
+    
+    try:
+        communicator = edge_tts.Communicate(text, voice=voice_id, rate=rate, volume=volume)
+        audio = bytearray()
+        audio_received = False
 
-    async for chunk in communicator.stream():
-        if chunk["type"] == "audio":
-            audio.extend(chunk["data"])
+        async for chunk in communicator.stream():
+            if chunk["type"] == "audio" and chunk.get("data"):
+                audio.extend(chunk["data"])
+                audio_received = True
 
-    return bytes(audio)
+        if not audio_received or len(audio) == 0:
+            raise RuntimeError(
+                f"No audio was received from edge-tts. "
+                f"Text length: {len(text)}, Voice: {voice_id}, Rate: {rate}, Volume: {volume}. "
+                f"Please verify that your parameters are correct."
+            )
+
+        return bytes(audio)
+    except Exception as exc:
+        # Re-raise with more context
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(
+            f"Speech synthesis error: {exc}. "
+            f"Text length: {len(text)}, Voice: {voice_id}"
+        ) from exc
+
+
+def _run_async_safely(coro):
+    """Run async function safely, handling existing event loops."""
+    try:
+        # Try to get the current event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If loop is running, we need to use a different approach
+            # Create a new event loop in a thread
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+        else:
+            # Loop exists but not running, we can use it
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        # No event loop exists, create a new one
+        return asyncio.run(coro)
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -241,17 +312,44 @@ def synthesize_speech(
     rate_value: int,
     volume_value: int,
 ) -> bytes:
+    """Synthesize speech from text with validation and error handling."""
+    if not text or not text.strip():
+        raise ValueError("Text cannot be empty for speech synthesis")
+    
+    if not voice_id:
+        raise ValueError("Voice ID cannot be empty")
+    
     rate = rate_to_edge(rate_value)
     volume = volume_to_edge(volume_value)
 
     chunks = chunk_text(text, MAX_CHARS_TTS)
+    if not chunks:
+        raise ValueError("No text chunks to synthesize")
+    
     audio_buffer = bytearray()
 
-    for chunk in chunks:
-        chunk_audio = asyncio.run(
-            synthesize_chunk(chunk, voice_id=voice_id, rate=rate, volume=volume)
+    for i, chunk in enumerate(chunks):
+        if not chunk or not chunk.strip():
+            # Skip empty chunks but warn
+            continue
+        
+        try:
+            chunk_audio = _run_async_safely(
+                synthesize_chunk(chunk, voice_id=voice_id, rate=rate, volume=volume)
+            )
+            if chunk_audio and len(chunk_audio) > 0:
+                audio_buffer.extend(chunk_audio)
+            else:
+                raise RuntimeError(f"Chunk {i+1} returned empty audio")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to synthesize chunk {i+1} of {len(chunks)}: {exc}"
+            ) from exc
+
+    if len(audio_buffer) == 0:
+        raise RuntimeError(
+            "No audio was generated. All chunks failed or returned empty audio."
         )
-        audio_buffer.extend(chunk_audio)
 
     return bytes(audio_buffer)
 
@@ -322,7 +420,7 @@ with col_translate:
         if not raw_text.strip():
             st.warning("Please paste some text before translating.")
         else:
-            with st.spinner("Translating. Large passages may take a moment..."):
+            with st.spinner("Translating. Large passages may take a moment (with automatic retries for rate limits)..."):
                 try:
                     translated = translate_large_text(raw_text, target_code)
                 except Exception as exc:
